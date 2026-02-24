@@ -37,6 +37,14 @@ from sklearn.metrics import classification_report
 def apply_threshold(y_scores, threshold):
     return (y_scores >= threshold).astype(int)
 
+
+def noshow_rate_total(stage2_pred, n_total):
+    """
+    CORRECTED: No-show rate as fraction of TOTAL population (not Stage 2 subset).
+    Use same denominator for original and counterfactual to avoid misleading comparisons.
+    """
+    return np.sum(stage2_pred == 0) / n_total if n_total > 0 else 0.0
+
 # =========================================
 # Stage 1: Cancellation detection (TRAINING)
 # =========================================
@@ -213,8 +221,9 @@ for seed in range(10):
     stage2_preds_orig, _ = stage_two_predict_only(stage2_model, orig_X_test, stage1_preds_orig, threshold=stage2_threshold)
     stage2_preds_cf, _   = stage_two_predict_only(stage2_model, cf_X_test_cssbp, stage1_preds_cf, threshold=stage2_threshold)
 
-    orig_noshow_rate = np.mean(stage2_preds_orig == 0)
-    cf_noshow_rate   = np.mean(stage2_preds_cf == 0)
+    n_total = len(stage1_preds_orig)
+    orig_noshow_rate = noshow_rate_total(stage2_preds_orig, n_total)
+    cf_noshow_rate   = noshow_rate_total(stage2_preds_cf, n_total)
     noshow_reduction = (orig_noshow_rate - cf_noshow_rate) * 100
 
     print("\n========== CSS-BP COUNTERFACTUAL SUMMARY ==========")
@@ -295,8 +304,9 @@ for seed in range(10):
         # Use fixed baseline denominator for comparability
         orig_cancellation_rate = np.mean(stage1_preds_orig == 1)
         cf_cancellation_rate = np.mean(stage1_preds_cf == 1)
-        orig_noshow_rate = np.mean(stage2_preds_orig == 0)
-        cf_noshow_rate = np.mean(stage2_preds_cf == 0)
+        n_total = len(stage1_preds_orig)
+        orig_noshow_rate = noshow_rate_total(stage2_preds_orig, n_total)
+        cf_noshow_rate = noshow_rate_total(stage2_preds_cf, n_total)
 
         cancel_reduction = (orig_cancellation_rate - cf_cancellation_rate) * 100
         noshow_reduction = (orig_noshow_rate - cf_noshow_rate) * 100
@@ -335,8 +345,9 @@ for seed in range(10):
 
         orig_cancellation_rate = np.mean(stage1_preds_orig == 1)
         cf_cancellation_rate = np.mean(stage1_preds_cf == 1)
-        orig_noshow_rate = np.mean(stage2_preds_orig == 0)
-        cf_noshow_rate = np.mean(stage2_preds_cf == 0)
+        n_total = len(stage1_preds_orig)
+        orig_noshow_rate = noshow_rate_total(stage2_preds_orig, n_total)
+        cf_noshow_rate = noshow_rate_total(stage2_preds_cf, n_total)
 
         cancel_reduction = (orig_cancellation_rate - cf_cancellation_rate) * 100
         noshow_reduction = (orig_noshow_rate - cf_noshow_rate) * 100
@@ -373,8 +384,9 @@ for seed in range(10):
 
         orig_cancellation_rate = np.mean(stage1_preds_orig == 1)
         cf_cancellation_rate = np.mean(stage1_preds_cf == 1)
-        orig_noshow_rate = np.mean(stage2_preds_orig == 0)
-        cf_noshow_rate = np.mean(stage2_preds_cf == 0)
+        n_total = len(stage1_preds_orig)
+        orig_noshow_rate = noshow_rate_total(stage2_preds_orig, n_total)
+        cf_noshow_rate = noshow_rate_total(stage2_preds_cf, n_total)
 
         cancel_reduction = (orig_cancellation_rate - cf_cancellation_rate) * 100
         noshow_reduction = (orig_noshow_rate - cf_noshow_rate) * 100
@@ -556,8 +568,9 @@ for seed in range(10):
     stage2_preds_orig, _ = stage_two_predict_only(stage2_model, orig_X_test, stage1_preds_orig, threshold=stage2_threshold)
     stage2_preds_cf, _   = stage_two_predict_only(stage2_model, cf_X_test_stage2, stage1_preds_cf, threshold=stage2_threshold)
 
-    orig_noshow_rate = np.mean(stage2_preds_orig == 0)
-    cf_noshow_rate   = np.mean(stage2_preds_cf == 0)
+    n_total = len(stage1_preds_orig)
+    orig_noshow_rate = noshow_rate_total(stage2_preds_orig, n_total)
+    cf_noshow_rate   = noshow_rate_total(stage2_preds_cf, n_total)
 
     noshow_reduction = (orig_noshow_rate - cf_noshow_rate) * 100
 
@@ -706,8 +719,9 @@ for seed in range(10):
     stage1_preds_cf = stage_one_predict_only(stage1_model, cf_X_test_stage2, threshold=stage1_threshold)
     stage2_preds_cf, _ = stage_two_predict_only(stage2_model, cf_X_test_stage2, stage1_preds_cf, threshold=stage2_threshold)
 
-    orig_noshow_rate = np.mean(stage2_preds_orig == 0)
-    cf_noshow_rate = np.mean(stage2_preds_cf == 0)
+    n_total = len(stage1_preds_orig)
+    orig_noshow_rate = noshow_rate_total(stage2_preds_orig, n_total)
+    cf_noshow_rate = noshow_rate_total(stage2_preds_cf, n_total)
     noshow_reduction = (orig_noshow_rate - cf_noshow_rate) * 100
 
     print("\n========== STAGE 2 COUNTERFACTUAL SUMMARY ==========")
@@ -828,8 +842,9 @@ for seed in range(10):
     stage1_preds_cf = stage_one_predict_only(stage1_model, cf_X_test_stage2, threshold=stage1_threshold)
     stage2_preds_cf, _ = stage_two_predict_only(stage2_model, cf_X_test_stage2, stage1_preds_cf, threshold=stage2_threshold)
 
-    orig_noshow_rate = np.mean(stage2_preds_orig == 0)
-    cf_noshow_rate = np.mean(stage2_preds_cf == 0)
+    n_total = len(stage1_preds_orig)
+    orig_noshow_rate = noshow_rate_total(stage2_preds_orig, n_total)
+    cf_noshow_rate = noshow_rate_total(stage2_preds_cf, n_total)
     noshow_reduction = (orig_noshow_rate - cf_noshow_rate) * 100
 
     print("\n========== STAGE 2 COUNTERFACTUAL SUMMARY ==========")
@@ -1002,8 +1017,9 @@ for seed in range(10):
     stage1_preds_cf = stage_one_predict_only(stage1_model, cf_X_test_stage2, threshold=stage1_threshold)
     stage2_preds_cf, _ = stage_two_predict_only(stage2_model, cf_X_test_stage2, stage1_preds_cf, threshold=stage2_threshold)
 
-    orig_noshow_rate = np.mean(stage2_preds_orig == 0)
-    cf_noshow_rate = np.mean(stage2_preds_cf == 0)
+    n_total = len(stage1_preds_orig)
+    orig_noshow_rate = noshow_rate_total(stage2_preds_orig, n_total)
+    cf_noshow_rate = noshow_rate_total(stage2_preds_cf, n_total)
     noshow_reduction = (orig_noshow_rate - cf_noshow_rate) * 100
 
     print("\n========== STAGE 2 COUNTERFACTUAL SUMMARY ==========")

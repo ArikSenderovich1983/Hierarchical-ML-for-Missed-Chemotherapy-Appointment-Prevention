@@ -22,19 +22,19 @@
 # =====================================================
 import glob  # To find file paths matching a pattern
 import pandas as pd  # To handle DataFrame operations
-from google.colab import drive  # To access files stored on Google Drive
 
 # =====================================================
-# Step 2: Mount Google Drive
+# Step 2: Local paths (no Google Drive)
 # =====================================================
-# This allows access to the files stored on your Google Drive
-drive.mount("/content/drive")
+import os
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_data_dir = os.path.join(_script_dir, "Merged", "Merged")
 
 # =====================================================
 # Step 3: Read and Combine All Text Files
 # =====================================================
 # Define the file path pattern to locate the text files
-file_path_pattern = '/content/drive/My Drive/Merged/Merged/*.txt'
+file_path_pattern = os.path.join(_data_dir, "*.txt")
 
 # Use glob to get a list of all files matching the pattern
 all_files = glob.glob(file_path_pattern)
@@ -84,9 +84,7 @@ df.head()
 total_rows = len(df)
 print(f"Total number of rows in the DataFrame: {total_rows}")
 
-
-Check duplicated data
-
+# Check duplicated data
 import pandas as pd
 
 # Assuming df is your DataFrame
@@ -133,8 +131,7 @@ total_duplicates = duplicate_counts.query('Count > 1')['Count'].sum() - len(dupl
 print(f"Total number of duplicate rows: {total_duplicates}")
 
 
-remove duplicated data
-
+# Remove duplicated data
 # Step 3: Remove duplicate rows while keeping the first occurrence
 df = df.drop_duplicates(subset=['PT_ID', 'ENCOUNTER_DTTM', 'SCHD_DTTM'], keep='first')
 
@@ -198,41 +195,16 @@ grouped_patients = df.groupby('PT_ID')
 
 # Process each patient group independently
 for patient_idx, (patient_id, group) in enumerate(grouped_patients):
-    # Display information about the current patient being processed
     num_appointments = group.shape[0]
-    print(f"Processing patient {patient_idx + 1}/{unique_patients} (Patient ID: {patient_id})")
-    print(f"Number of appointments: {num_appointments}")
+    if (patient_idx + 1) % 5000 == 0 or patient_idx == 0:
+        print(f"Processing patient {patient_idx + 1}/{unique_patients}...")
 
-    # Process each row (appointment) for the current patient
     for i, current_row in group.iterrows():
         current_schd_dttm = current_row['SCHD_DTTM']
-
-        # Get previous rows where SCHD_DTTM < current SCHD_DTTM
         previous_rows = group[group['SCHD_DTTM'] < current_schd_dttm]
-        print(f"  Total previous rows before {current_schd_dttm}: {previous_rows.shape[0]}")
-
-        # Filter rows with valid cancellations (relative to current schedule)
-        valid_cancellation_rows = previous_rows[~previous_rows['CNCL_DTTM'].isna() & (previous_rows['CNCL_DTTM'] < current_schd_dttm)]
-        print(f"    Valid cancellations: {valid_cancellation_rows.shape[0]}")
-
-        # Filter rows with valid encounters (relative to current schedule)
-        valid_encounter_rows = previous_rows[~previous_rows['ENCOUNTER_DTTM'].isna() & (previous_rows['ENCOUNTER_DTTM'] < current_schd_dttm)]
-        print(f"    Valid encounters: {valid_encounter_rows.shape[0]}")
-
-        # Combine valid cancellation and encounter rows
         valid_previous_rows = previous_rows[(~previous_rows['CNCL_DTTM'].isna() & (previous_rows['CNCL_DTTM'] < current_schd_dttm)) |
                                            (~previous_rows['ENCOUNTER_DTTM'].isna() & (previous_rows['ENCOUNTER_DTTM'] < current_schd_dttm))]
-        print(f"    Valid previous rows (either condition): {valid_previous_rows.shape[0]}")
-
-        # Store the valid previous row indices for the current appointment
         filtered_previous_indices[i] = valid_previous_rows.index.tolist()
-
-        # Display valid indices for the current scheduled time
-        print(f"  For scheduled time {current_schd_dttm}, valid previous indices: {filtered_previous_indices[i]}")
-
-    # Print completion message for the patient
-    print(f"Finished processing patient {patient_id} with {num_appointments} appointments")
-    print("----------")
 
 
 # =====================================================
@@ -258,8 +230,8 @@ print(df[['PT_ID', 'SCHD_DTTM','ENCOUNTER_DTTM','CNCL_DTTM','STATUS_CD', 'valid_
 # =====================================================
 # Step 9: Save the Resulting DataFrame
 # =====================================================
-# Define the CSV save path
-csv_save_path = '/content/drive/My Drive/Merged/df_with_valid_indices_0717.csv'
+# Define the CSV save path (local)
+csv_save_path = os.path.join(_script_dir, "df_with_valid_indices_0717.csv")
 
 # Save the DataFrame to the specified path
 df.to_csv(csv_save_path, index=False)

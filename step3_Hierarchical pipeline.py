@@ -78,11 +78,11 @@ if _RUNNING_IN_COLAB:
     drive.mount('/content/drive')
 
 # =========================
-# 1) LOAD DATA
+# 1) LOAD DATA (local paths)
 # =========================
-# Update paths if needed
-df1_path = '/content/drive/My Drive/Merged/df_variables_0717.csv'
-df2_path = '/content/drive/My Drive/Merged/df_with_valid_indices_0717.csv'
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+df1_path = os.path.join(_script_dir, 'df_variables_0717.csv')
+df2_path = os.path.join(_script_dir, 'df_with_valid_indices_0717.csv')
 
 df1 = pd.read_csv(df1_path)
 df2 = pd.read_csv(df2_path)

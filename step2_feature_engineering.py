@@ -22,22 +22,19 @@
 # 17. Provider Interpreter Flag
 # 18. Save Final Data
 
-# Mount Google Drive to access files
-from google.colab import drive
-drive.mount('/content/drive')
-
 # Import necessary libraries
+import os
 import pandas as pd
 import ast  # To safely evaluate the list-like strings into actual lists
 
 # ----------------------------- #
-# Step 1: Load the DataFrame
+# Step 1: Load the DataFrame (local path)
 # ----------------------------- #
-# Define the path to your file in Google Drive
-csv_save_path = '/content/drive/My Drive/Merged/df_with_valid_indices_0717.csv'
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+csv_load_path = os.path.join(_script_dir, 'df_with_valid_indices_0717.csv')
 
 # Load the CSV into a DataFrame
-df = pd.read_csv(csv_save_path)
+df = pd.read_csv(csv_load_path)
 
 # Display the first few rows of the DataFrame to confirm it's loaded correctly
 print(df.head())
@@ -653,8 +650,8 @@ columns_to_save = [
     'Last_VISIT_TYPE', 'Last_ENCOUNTER_TYPE','Last_Cancellation_Category'
 ]
 
-# Save the DataFrame with only the required columns
-csv_save_path = '/content/drive/My Drive/Merged/df_variables_0717.csv'
+# Save the DataFrame with only the required columns (local)
+csv_save_path = os.path.join(_script_dir, 'df_variables_0717.csv')
 df[columns_to_save].to_csv(csv_save_path, index=False)
 
 
