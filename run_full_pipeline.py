@@ -30,9 +30,8 @@ DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── config ───────────────────────────────────────────────────────────────────
 CUTOFFS        = [24, 48, 72, 96, 168]
-N_SEEDS        = 10
-S1_THR         = 0.43
-S2_THR         = 0.83
+N_HOLDOUTS     = 10
+N_BOOTSTRAP    = 100
 RS             = 42
 XGB_KW         = dict(eval_metric="logloss", verbosity=0, tree_method="hist", n_jobs=-1)
 
@@ -284,11 +283,12 @@ def build_labels(df, cutoff):
 
 def _thr(sc, t): return (sc >= t).astype(int)
 
-def train_pipeline(X_tr, X_te, y_tr, y_te, seed=RS):
+def train_pipeline(X_tr, X_te, y_tr, y_te, s1_thr=0.43, s2_thr=0.83, seed=RS):
+    """Train DT->XGB pipeline with specified thresholds."""
     y1tr = (y_tr == 2).astype(int); y1te = (y_te == 2).astype(int)
     s1 = DecisionTreeClassifier(random_state=seed)
     s1.fit(X_tr, y1tr)
-    s1p = _thr(s1.predict_proba(X_te)[:, 1], S1_THR)
+    s1p = _thr(s1.predict_proba(X_te)[:, 1], s1_thr)
 
     m1 = {}
     for cls, n in [(1, "Cancel"), (0, "Not-Cancel")]:
@@ -306,7 +306,7 @@ def train_pipeline(X_tr, X_te, y_tr, y_te, seed=RS):
     y2tr_b = (y2tr == 0).astype(int); y2te_b = (y2te == 0).astype(int)
     s2 = XGBClassifier(random_state=seed, **XGB_KW)
     s2.fit(X2tr, y2tr_b)
-    s2p = _thr(s2.predict_proba(X2te)[:, 1], S2_THR)
+    s2p = _thr(s2.predict_proba(X2te)[:, 1], s2_thr)
 
     m2 = {}
     for cls, n in [(0, "No-Show"), (1, "Show")]:
@@ -320,25 +320,51 @@ def train_pipeline(X_tr, X_te, y_tr, y_te, seed=RS):
     return s1, s2, m1, m2
 
 
-def combined_f1(s1, s2, X, y):
-    X = np.nan_to_num(X.astype(np.float32), nan=0, posinf=0, neginf=0)
-    s1p = _thr(s1.predict_proba(X)[:, 1], S1_THR)
-    pred = np.full(len(y), -1)
-    pred[s1p == 1] = 2
-    nc = np.where(s1p == 0)[0]
-    if len(nc):
-        s2p = _thr(s2.predict_proba(X[nc])[:, 1], S2_THR)
-        pred[nc[s2p == 1]] = 0
-        pred[nc[s2p == 0]] = 1
-    y = np.asarray(y, dtype=int)
-    return tuple(f1_score(y, pred, labels=[c], average=None, zero_division=0)[0] for c in [2, 1, 0])
+def tune_thresholds(s1, s2, Xval, yval):
+    """
+    Sweep thresholds on validation set to maximize per-stage F1.
+    Returns (best_s1_thr, best_s2_thr).
+    """
+    Xval = np.nan_to_num(Xval.astype(np.float32), nan=0, posinf=0, neginf=0)
+    y1val = (yval == 2).astype(int)
+    
+    # Stage 1: sweep threshold for Cancel F1 (step=0.10 to avoid over-tuning)
+    s1_probs = s1.predict_proba(Xval)[:, 1]
+    best_s1_thr, best_s1_f1 = 0.5, 0.0
+    for thr in np.arange(0.1, 1.0, 0.1):
+        s1p = _thr(s1_probs, thr)
+        f1_cancel = f1_score(y1val, s1p, pos_label=1, zero_division=0)
+        if f1_cancel > best_s1_f1:
+            best_s1_f1 = f1_cancel
+            best_s1_thr = thr
+    
+    # Stage 2: filter by Stage 1, then sweep threshold for No-Show F1
+    s1p_best = _thr(s1_probs, best_s1_thr)
+    i2val = np.where(s1p_best == 0)[0]
+    if len(i2val) == 0:
+        return (best_s1_thr, 0.5)
+    
+    X2val, y2val = Xval[i2val], yval[i2val]
+    y2val_b = (y2val == 0).astype(int)
+    s2_probs = s2.predict_proba(X2val)[:, 1]
+    
+    best_s2_thr, best_s2_f1 = 0.5, 0.0
+    for thr in np.arange(0.1, 1.0, 0.1):
+        s2p = _thr(s2_probs, thr)
+        f1_noshow = f1_score(y2val_b, s2p, pos_label=0, zero_division=0)
+        if f1_noshow > best_s2_f1:
+            best_s2_f1 = f1_noshow
+            best_s2_thr = thr
+    
+    return (round(best_s1_thr, 2), round(best_s2_thr, 2))
+
 
 # =============================================================================
 # PART 4 — SEMI-SUPERVISED
 # =============================================================================
 
 def self_train(mdl, Xtr, ytr, Xu, thr, maxiter=10, seed=RS):
-    # Clean inputs
+    # Clean inputs (fillna(0))
     Xtr = np.nan_to_num(Xtr, nan=0, posinf=0, neginf=0)
     Xu = np.nan_to_num(Xu, nan=0, posinf=0, neginf=0)
     
@@ -365,7 +391,7 @@ def run_semi_sup(X_all, y_all, ff, thr=None, seed=RS):
     Xu = X_all[~lab]
     Xtr, Xte, ytr, yte = train_test_split(Xl, yl, test_size=0.2, random_state=seed, stratify=yl)
     
-    # Clean NaN/inf BEFORE scaling
+    # Clean NaN/inf BEFORE scaling (fillna(0))
     Xtr = np.nan_to_num(Xtr, nan=0, posinf=0, neginf=0)
     Xte = np.nan_to_num(Xte, nan=0, posinf=0, neginf=0)
     Xu = np.nan_to_num(Xu, nan=0, posinf=0, neginf=0)
@@ -377,7 +403,7 @@ def run_semi_sup(X_all, y_all, ff, thr=None, seed=RS):
         Xte2[:, ni] = sc.transform(Xte[:, ni])
         if len(Xu2): Xu2[:, ni] = sc.transform(Xu[:, ni])
     
-    # Clean again after scaling (in case StandardScaler produced NaN/inf)
+    # Clean again after scaling (fillna(0))
     Xtr2 = np.nan_to_num(Xtr2, nan=0, posinf=0, neginf=0).astype(np.float32)
     Xte2 = np.nan_to_num(Xte2, nan=0, posinf=0, neginf=0).astype(np.float32)
     Xu2  = np.nan_to_num(Xu2,  nan=0, posinf=0, neginf=0).astype(np.float32) if len(Xu2) else np.empty((0, Xtr2.shape[1]), dtype=np.float32)
@@ -411,48 +437,72 @@ def run_semi_sup(X_all, y_all, ff, thr=None, seed=RS):
 # PART 5 — SPLIT STRATEGIES
 # =============================================================================
 
-def patient_split(df, ff):
-    u = df["PT_ID"].unique()
-    tri, tei = train_test_split(u, test_size=0.2, random_state=RS)
-    dtr = df[df["PT_ID"].isin(tri)]; dte = df[df["PT_ID"].isin(tei)]
-    return dtr[ff].values, dte[ff].values, dtr["primary_head_label"].values, dte["primary_head_label"].values
-
-def temporal_split(df, ff):
-    df = df.sort_values(["PT_ID", "ENCOUNTER_DTTM"], ignore_index=True)
-    tr, te = [], []
-    for _, g in df.groupby("PT_ID", sort=False):
-        si = max(1, int(0.8 * len(g)))
-        tr.append(g.iloc[:si]); te.append(g.iloc[si:])
-    dtr = pd.concat(tr, ignore_index=True); dte = pd.concat(te, ignore_index=True)
-    return dtr[ff].values, dte[ff].values, dtr["primary_head_label"].values, dte["primary_head_label"].values
-
-def std_split(df, ff, kind="row"):
+def holdout_split(df, ff, seed, kind="row"):
+    """
+    Create 60/20/20 train/val/test split with StandardScaler.
+    Returns: Xtr, Xval, Xte, ytr, yval, yte, Xte_df
+    """
     if kind == "row":
         X = df[ff].values; y = df["primary_head_label"].values
-        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=RS, stratify=y)
+        # Split into 60% train, 40% temp
+        Xtr, Xtemp, ytr, ytemp = train_test_split(X, y, test_size=0.4, random_state=seed, stratify=y)
+        # Split temp into 50/50 -> val (20%), test (20%)
+        Xval, Xte, yval, yte = train_test_split(Xtemp, ytemp, test_size=0.5, random_state=seed, stratify=ytemp)
     elif kind == "patient":
-        Xtr, Xte, ytr, yte = patient_split(df, ff)
-    else:
-        Xtr, Xte, ytr, yte = temporal_split(df, ff)
+        u = df["PT_ID"].unique()
+        tr_pts, temp_pts = train_test_split(u, test_size=0.4, random_state=seed)
+        val_pts, te_pts = train_test_split(temp_pts, test_size=0.5, random_state=seed)
+        dtr = df[df["PT_ID"].isin(tr_pts)]
+        dval = df[df["PT_ID"].isin(val_pts)]
+        dte = df[df["PT_ID"].isin(te_pts)]
+        Xtr, ytr = dtr[ff].values, dtr["primary_head_label"].values
+        Xval, yval = dval[ff].values, dval["primary_head_label"].values
+        Xte, yte = dte[ff].values, dte["primary_head_label"].values
+    else:  # temporal
+        df = df.sort_values(["PT_ID", "ENCOUNTER_DTTM"], ignore_index=True)
+        tr, val, te = [], [], []
+        for _, g in df.groupby("PT_ID", sort=False):
+            n = len(g)
+            tr_end = max(1, int(0.6 * n))
+            val_end = max(tr_end + 1, int(0.8 * n))
+            tr.append(g.iloc[:tr_end])
+            val.append(g.iloc[tr_end:val_end])
+            te.append(g.iloc[val_end:])
+        dtr = pd.concat(tr, ignore_index=True)
+        dval = pd.concat(val, ignore_index=True)
+        dte = pd.concat(te, ignore_index=True)
+        Xtr, ytr = dtr[ff].values, dtr["primary_head_label"].values
+        Xval, yval = dval[ff].values, dval["primary_head_label"].values
+        Xte, yte = dte[ff].values, dte["primary_head_label"].values
     
-    # Clean NaN/inf BEFORE scaling
+    # Clean NaN/inf BEFORE scaling (fillna(0))
     Xtr = np.nan_to_num(Xtr, nan=0, posinf=0, neginf=0)
+    Xval = np.nan_to_num(Xval, nan=0, posinf=0, neginf=0)
     Xte = np.nan_to_num(Xte, nan=0, posinf=0, neginf=0)
     
-    Xtr = pd.DataFrame(Xtr, columns=ff); Xte = pd.DataFrame(Xte, columns=ff)
-    sc = StandardScaler(); np_ = [c for c in NUMERICAL if c in Xtr.columns]
-    Xtr[np_] = sc.fit_transform(Xtr[np_]); Xte[np_] = sc.transform(Xte[np_])
+    # StandardScaler on numerical features
+    Xtr_df = pd.DataFrame(Xtr, columns=ff)
+    Xval_df = pd.DataFrame(Xval, columns=ff)
+    Xte_df = pd.DataFrame(Xte, columns=ff)
+    sc = StandardScaler()
+    np_cols = [c for c in NUMERICAL if c in ff]
+    Xtr_df[np_cols] = sc.fit_transform(Xtr_df[np_cols])
+    Xval_df[np_cols] = sc.transform(Xval_df[np_cols])
+    Xte_df[np_cols] = sc.transform(Xte_df[np_cols])
     
-    # Clean again after scaling
-    return (np.nan_to_num(Xtr.values.astype(np.float32), nan=0, posinf=0, neginf=0),
-            np.nan_to_num(Xte.values.astype(np.float32), nan=0, posinf=0, neginf=0), ytr, yte, Xte)
+    # Clean again after scaling (fillna(0))
+    Xtr = np.nan_to_num(Xtr_df.values.astype(np.float32), nan=0, posinf=0, neginf=0)
+    Xval = np.nan_to_num(Xval_df.values.astype(np.float32), nan=0, posinf=0, neginf=0)
+    Xte = np.nan_to_num(Xte_df.values.astype(np.float32), nan=0, posinf=0, neginf=0)
+    
+    return Xtr, Xval, Xte, ytr, yval, yte, Xte_df
 
 # =============================================================================
-# PART 6 — COUNTERFACTUAL  (CORRECTED DENOMINATOR)
+# PART 6 — COUNTERFACTUAL  (CORRECTED DENOMINATOR + BOOTSTRAP)
 # =============================================================================
 
-def _s1p(m, X): return _thr(m.predict_proba(X)[:, 1], S1_THR)
-def _s2p(m, X, s1): return _thr(m.predict_proba(X[s1 == 0])[:, 1], S2_THR)
+def _s1p(m, X, thr): return _thr(m.predict_proba(X)[:, 1], thr)
+def _s2p(m, X, s1, thr): return _thr(m.predict_proba(X[s1 == 0])[:, 1], thr)
 def _nsr(s2p, n): return np.sum(s2p == 0) / n if n else 0
 
 def _flip(cf, pct, seed):
@@ -514,39 +564,130 @@ def apply_iv(X_df, name, seed=0):
 
 IVS = ["SMS Reminders","Patient Confirmation","Reduced Lead Time",
        "Provider Consistency","Commitment-Based"]
+STOCHASTIC_IVS = ["SMS Reminders", "Patient Confirmation", "Reduced Lead Time"]
 
-def run_cf(Xtr, Xte_df, ytr, yte, ff):
+def run_cf_bootstrap(Xtr, Xte_df, ytr, yte, ff, s1_thr, s2_thr, seed=RS):
+    """
+    Run counterfactual with bootstrap for stochastic interventions.
+    Returns: dict[intervention] = {"mean_cancel": float, "var_cancel": float, 
+                                     "mean_noshow": float, "var_noshow": float}
+    """
     Xtr_np = np.nan_to_num(np.array(Xtr, dtype=np.float32), nan=0, posinf=0, neginf=0)
-    res = {iv: {"cancel": [], "noshow": []} for iv in IVS}
-    for seed in range(N_SEEDS):
-        np.random.seed(seed); random.seed(seed)
-        s1 = DecisionTreeClassifier(random_state=seed)
-        s1.fit(Xtr_np, (ytr == 2).astype(int))
-        i2 = np.where(ytr != 2)[0]
-        s2 = XGBClassifier(random_state=seed, **XGB_KW)
-        s2.fit(Xtr_np[i2], (ytr[i2] == 0).astype(int))
-        orig = np.nan_to_num(Xte_df[ff].values.astype(np.float32), nan=0, posinf=0, neginf=0)
-        s1o = _s1p(s1, orig); s2o = _s2p(s2, orig, s1o)
-        nt = len(s1o); oc = np.mean(s1o==1); ons = _nsr(s2o, nt)
-        for iv in IVS:
+    
+    # Train models once per holdout
+    np.random.seed(seed)
+    random.seed(seed)
+    s1 = DecisionTreeClassifier(random_state=seed)
+    s1.fit(Xtr_np, (ytr == 2).astype(int))
+    i2 = np.where(ytr != 2)[0]
+    s2 = XGBClassifier(random_state=seed, **XGB_KW)
+    s2.fit(Xtr_np[i2], (ytr[i2] == 0).astype(int))
+    
+    # Baseline predictions (no intervention)
+    orig = np.nan_to_num(Xte_df[ff].values.astype(np.float32), nan=0, posinf=0, neginf=0)
+    s1o = _s1p(s1, orig, s1_thr)
+    s2o = _s2p(s2, orig, s1o, s2_thr)
+    nt = len(s1o)
+    oc = np.mean(s1o==1)
+    ons = _nsr(s2o, nt)
+    
+    res = {}
+    for iv in IVS:
+        if iv in STOCHASTIC_IVS:
+            # Bootstrap: 100 iterations with different random seeds
+            cancel_deltas, noshow_deltas = [], []
+            for boot_seed in range(N_BOOTSTRAP):
+                cfdf = apply_iv(Xte_df, iv, seed=seed*1000 + boot_seed)
+                cfnp = np.nan_to_num(cfdf[ff].values.astype(np.float32), nan=0, posinf=0, neginf=0)
+                s1c = _s1p(s1, cfnp, s1_thr)
+                s2c = _s2p(s2, cfnp, s1c, s2_thr)
+                cancel_deltas.append((oc - np.mean(s1c==1))*100)
+                noshow_deltas.append((ons - _nsr(s2c, nt))*100)
+            res[iv] = {
+                "mean_cancel": np.mean(cancel_deltas),
+                "var_cancel": np.var(cancel_deltas, ddof=1) if len(cancel_deltas) > 1 else 0.0,
+                "mean_noshow": np.mean(noshow_deltas),
+                "var_noshow": np.var(noshow_deltas, ddof=1) if len(noshow_deltas) > 1 else 0.0,
+            }
+        else:
+            # Deterministic: single run
             cfdf = apply_iv(Xte_df, iv, seed=seed)
             cfnp = np.nan_to_num(cfdf[ff].values.astype(np.float32), nan=0, posinf=0, neginf=0)
-            s1c = _s1p(s1, cfnp); s2c = _s2p(s2, cfnp, s1c)
-            res[iv]["cancel"].append((oc - np.mean(s1c==1))*100)
-            res[iv]["noshow"].append((ons - _nsr(s2c, nt))*100)
+            s1c = _s1p(s1, cfnp, s1_thr)
+            s2c = _s2p(s2, cfnp, s1c, s2_thr)
+            cancel_delta = (oc - np.mean(s1c==1))*100
+            noshow_delta = (ons - _nsr(s2c, nt))*100
+            res[iv] = {
+                "mean_cancel": cancel_delta,
+                "var_cancel": 0.0,
+                "mean_noshow": noshow_delta,
+                "var_noshow": 0.0,
+            }
+    
     return res
 
 # =============================================================================
-# PART 7 — LATEX WRITER
+# PART 7 — AGGREGATION HELPERS
 # =============================================================================
+
+def aggregate_metrics(metric_list):
+    """Aggregate list of metric dicts to mean +/- SD (handles nested class dicts)."""
+    keys = metric_list[0].keys()
+    agg = {}
+    for k in keys:
+        sample = metric_list[0][k]
+        if isinstance(sample, dict):
+            inner_keys = sample.keys()
+            agg[k] = {}
+            for ik in inner_keys:
+                if ik == "support":
+                    agg[k][ik] = sample[ik]
+                else:
+                    vals = [m[k][ik] for m in metric_list]
+                    agg[k][ik] = {"mean": np.mean(vals), "std": np.std(vals, ddof=1) if len(vals) > 1 else 0.0}
+        else:
+            vals = [m[k] for m in metric_list]
+            agg[k] = {"mean": np.mean(vals), "std": np.std(vals, ddof=1) if len(vals) > 1 else 0.0}
+    return agg
+
+def aggregate_table5(holdout_results):
+    """
+    Aggregate Table 5 using law of total variance.
+    holdout_results: list of dicts, each dict[iv] = {"mean_cancel": float, "var_cancel": float, ...}
+    Returns: dict[iv] = {"cancel_mean": float, "cancel_std": float, ...}
+    """
+    ivs = holdout_results[0].keys()
+    agg = {}
+    for iv in ivs:
+        # Collect holdout means and variances
+        cancel_means = [h[iv]["mean_cancel"] for h in holdout_results]
+        cancel_vars = [h[iv]["var_cancel"] for h in holdout_results]
+        noshow_means = [h[iv]["mean_noshow"] for h in holdout_results]
+        noshow_vars = [h[iv]["var_noshow"] for h in holdout_results]
+        
+        # Law of total variance: total_var = mean(within_var) + var(means)
+        if len(cancel_means) > 1:
+            cancel_total_var = np.mean(cancel_vars) + np.var(cancel_means, ddof=1)
+            noshow_total_var = np.mean(noshow_vars) + np.var(noshow_means, ddof=1)
+        else:
+            cancel_total_var = np.mean(cancel_vars)
+            noshow_total_var = np.mean(noshow_vars)
+        
+        agg[iv] = {
+            "cancel_mean": np.mean(cancel_means),
+            "cancel_std": np.sqrt(cancel_total_var),
+            "noshow_mean": np.mean(noshow_means),
+            "noshow_std": np.sqrt(noshow_total_var),
+        }
+    return agg
 
 def _f(v, d=2): return f"{v:.{d}f}"
 def _fb(v, d=2): return f"\\textbf{{{v:.{d}f}}}"
-def _pm(vs):
-    m, s = np.mean(vs), np.std(vs)
-    return f"${m:.2f} \\pm {s:.2f}$"
+def _pm(m, s, d=2): return f"${m:.{d}f} \\pm {s:.{d}f}$"
+def _pmb(m, s, d=2): return f"$\\textbf{{{m:.{d}f}}} \\pm {s:.{d}f}$"
 
-def write_latex(t1, t2, t3, t4, t5, path):
+def write_latex(t1, t3, t4, t5, path):
+    """Write LaTeX tables with mean +/- SD."""
     L = []
     a = L.append
     a(r"\documentclass{article}")
@@ -559,8 +700,8 @@ def write_latex(t1, t2, t3, t4, t5, path):
 
     # TABLE 1
     a(r"\begin{table*}[t]\centering")
-    a(r"\caption{Performance of the two-stage pipeline (Decision Tree $\rightarrow$ XGBoost) across no-show cutoff definitions (24h--168h).}")
-    a(r"\label{tab:multi_cutoff_results_clean_boldf1}\small")
+    a(r"\caption{Performance of the two-stage pipeline (Decision Tree $\rightarrow$ XGBoost) across no-show cutoff definitions (24h--168h). Mean $\pm$ SD over 10 holdout splits.}")
+    a(r"\label{tab:multi_cutoff_results_robust}\small")
     a(r"\begin{tabular}{l c c c c c}\toprule")
     a(r"\textbf{Metric} & \textbf{24h} & \textbf{48h} & \textbf{72h} & \textbf{96h} & \textbf{168h} \\")
     a(r"\midrule")
@@ -569,81 +710,48 @@ def write_latex(t1, t2, t3, t4, t5, path):
         ("F1 (Cancel)","Cancel","f1"),("Precision (Not-Cancel)","Not-Cancel","precision"),
         ("Recall (Not-Cancel)","Not-Cancel","recall"),("F1 (Not-Cancel)","Not-Cancel","f1")]:
         bold = "F1" in mn.split("(")[0]
-        vs = [(_fb if bold else _f)(t1[c][0][cls][fld]) for c in CUTOFFS]
+        vs = [(_pmb if bold else _pm)(t1[c][0][cls][fld]["mean"], t1[c][0][cls][fld]["std"]) for c in CUTOFFS]
         a(f"{mn:25s} & " + " & ".join(vs) + r" \\")
-    a(f"{'Macro F1':25s} & " + " & ".join([_fb(t1[c][0]["macro_f1"]) for c in CUTOFFS]) + r" \\")
-    a(f"{'Accuracy':25s} & " + " & ".join([_f(t1[c][0]["accuracy"]) for c in CUTOFFS]) + r" \\")
-    a(f"{'Cancel Support':25s} & " + " & ".join([f'{t1[c][0]["Cancel"]["support"]:,}' for c in CUTOFFS]) + r" \\")
-    a(f"{'Not-Cancel Support':25s} & " + " & ".join([f'{t1[c][0]["Not-Cancel"]["support"]:,}' for c in CUTOFFS]) + r" \\")
-    a(f"{'Total':25s} & " + " & ".join([f'{t1[c][0]["Cancel"]["support"]+t1[c][0]["Not-Cancel"]["support"]:,}' for c in CUTOFFS]) + r" \\")
+    a(f"{'Macro F1':25s} & " + " & ".join([_pmb(t1[c][0]["macro_f1"]["mean"], t1[c][0]["macro_f1"]["std"]) for c in CUTOFFS]) + r" \\")
+    a(f"{'Accuracy':25s} & " + " & ".join([_pm(t1[c][0]["accuracy"]["mean"], t1[c][0]["accuracy"]["std"]) for c in CUTOFFS]) + r" \\")
     a(r"\midrule\multicolumn{6}{l}{\textbf{Stage 2: XGBoost (Show vs No-Show)}} \\")
     for mn, cls, fld in [("Precision (No-Show)","No-Show","precision"),("Recall (No-Show)","No-Show","recall"),
         ("F1 (No-Show)","No-Show","f1"),("Precision (Show)","Show","precision"),
         ("Recall (Show)","Show","recall"),("F1 (Show)","Show","f1")]:
         bold = "F1" in mn.split("(")[0]
-        vs = [(_fb if bold else _f)(t1[c][1][cls][fld]) for c in CUTOFFS]
+        vs = [(_pmb if bold else _pm)(t1[c][1][cls][fld]["mean"], t1[c][1][cls][fld]["std"]) for c in CUTOFFS]
         a(f"{mn:25s} & " + " & ".join(vs) + r" \\")
-    a(f"{'Macro F1':25s} & " + " & ".join([_fb(t1[c][1]["macro_f1"]) for c in CUTOFFS]) + r" \\")
-    a(f"{'Accuracy':25s} & " + " & ".join([_f(t1[c][1]["accuracy"]) for c in CUTOFFS]) + r" \\")
-    a(f"{'No-Show Support':25s} & " + " & ".join([f'{t1[c][1]["No-Show"]["support"]:,}' for c in CUTOFFS]) + r" \\")
-    a(f"{'Show Support':25s} & " + " & ".join([f'{t1[c][1]["Show"]["support"]:,}' for c in CUTOFFS]) + r" \\")
-    a(f"{'Total':25s} & " + " & ".join([f'{t1[c][1]["No-Show"]["support"]+t1[c][1]["Show"]["support"]:,}' for c in CUTOFFS]) + r" \\")
+    a(f"{'Macro F1':25s} & " + " & ".join([_pmb(t1[c][1]["macro_f1"]["mean"], t1[c][1]["macro_f1"]["std"]) for c in CUTOFFS]) + r" \\")
+    a(f"{'Accuracy':25s} & " + " & ".join([_pm(t1[c][1]["accuracy"]["mean"], t1[c][1]["accuracy"]["std"]) for c in CUTOFFS]) + r" \\")
     a(r"\bottomrule\end{tabular}")
-    a(r"\begin{flushleft}\footnotesize \textit{Note: F1 scores are in \textbf{bold}.}\end{flushleft}\end{table*}")
+    a(r"\begin{flushleft}\footnotesize \textit{Note: F1 scores are in \textbf{bold}. Reported as mean $\pm$ SD over 10 holdout splits.}\end{flushleft}\end{table*}")
     a("")
 
-    # TABLE 2
+    # TABLE 3 (XGBoost only)
     a(r"\begin{table*}[t]\centering")
-    a(r"\caption{Semi-supervised Learning Sensitivity Analysis: No-Show Reason Prediction.}")
-    a(r"\label{tab:reason_prediction_sensitivity_final}\small")
-    a(r"\begin{tabularx}{\textwidth}{l l CC CC CC}\toprule")
-    a(r"\multirow{2}{*}{\textbf{Cutoff}} & \multirow{2}{*}{\textbf{Model}} & \multicolumn{2}{c}{\textbf{No Pseudo-Labels}} & \multicolumn{2}{c}{\textbf{Pseudo-Labels (0.60)}} & \multicolumn{2}{c}{\textbf{Pseudo-Labels (0.85)}} \\")
-    a(r"\cmidrule(lr){3-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}")
-    a(r"& & \textbf{Acc.} & \textbf{F1} & \textbf{Acc.} & \textbf{F1} & \textbf{Acc.} & \textbf{F1} \\\midrule")
-    mns = ["DecisionTree","XGBoost","MLP"]
-    conds = ["No Pseudo-Labels","Pseudo-Labels (0.60)","Pseudo-Labels (0.85)"]
-    for ci, c in enumerate(CUTOFFS):
-        af1 = [t2[c].get((m, co), (0,0))[1] for m in mns for co in conds]
-        bf1 = max(af1)
-        a(f"\\multirow{{3}}{{*}}{{\\textbf{{{c}h}}}} ")
-        for m in mns:
-            cells = []
-            for co in conds:
-                ac, f = t2[c].get((m, co), (0, 0))
-                cells.append(f"{(_fb if f==bf1 and f>0 else _f)(ac)} & {(_fb if f==bf1 and f>0 else _f)(f)}")
-            a(f"& {m:12s} & " + " & ".join(cells) + r" \\")
-        if ci < len(CUTOFFS)-1: a(r"\midrule")
-    a(r"\bottomrule\end{tabularx}\end{table*}")
-    a("")
-
-    # TABLE 3
-    a(r"\begin{table*}[t]\centering")
-    a(r"\caption{Model performance on predicting reasons for no-shows and cancellations.}\small")
+    a(r"\caption{XGBoost performance on predicting reasons for no-shows and cancellations. Mean $\pm$ SD over 10 holdout splits.}\small")
     a(r"\begin{tabular}{lcccc}\toprule")
-    a(r"\textbf{Model} & \textbf{No-Show Acc} & \textbf{No-Show F1} & \textbf{Cancel Acc} & \textbf{Cancel F1} \\\midrule")
+    a(r"\textbf{Cutoff} & \textbf{No-Show Acc} & \textbf{No-Show F1} & \textbf{Cancel Acc} & \textbf{Cancel F1} \\\midrule")
     for c in CUTOFFS:
-        a(f"\\multicolumn{{5}}{{c}}{{\\textbf{{{c}h}}}} \\\\")
-        bf = max(t3[c][m][1] for m in mns)
-        for m in mns:
-            na, nf, ca, cf_ = t3[c][m]
-            b = nf == bf and nf > 0
-            a(f"{m:12s} & {(_fb if b else _f)(na,3)} & {(_fb if b else _f)(nf,3)} & {(_fb if b else _f)(ca,3)} & {(_fb if b else _f)(cf_,3)} \\\\")
-        a(r"\midrule")
-    L[-1] = r"\bottomrule"
-    a(r"\end{tabular}\label{tab:final_reason_prediction_vertical}\end{table*}")
+        na_m, na_s = t3[c]["noshow"]["mean"], t3[c]["noshow"]["std"]
+        nf_m, nf_s = t3[c]["noshow_f1"]["mean"], t3[c]["noshow_f1"]["std"]
+        ca_m, ca_s = t3[c]["cancel"]["mean"], t3[c]["cancel"]["std"]
+        cf_m, cf_s = t3[c]["cancel_f1"]["mean"], t3[c]["cancel_f1"]["std"]
+        a(f"{c}h & {_pm(na_m, na_s, 3)} & {_pmb(nf_m, nf_s, 3)} & {_pm(ca_m, ca_s, 3)} & {_pm(cf_m, cf_s, 3)} \\\\")
+    a(r"\bottomrule\end{tabular}\label{tab:final_reason_prediction_robust}\end{table*}")
     a("")
 
     # TABLE 4
     a(r"\begin{table*}[t]\centering")
-    a(r"\caption{F1-scores across data splitting strategies.}")
-    a(r"\label{tab:split_f1_results_sensitivity}\small")
+    a(r"\caption{F1-scores across data splitting strategies. Mean $\pm$ SD over 10 holdout splits.}")
+    a(r"\label{tab:split_f1_results_robust}\small")
     a(r"\begin{tabularx}{\textwidth}{l l CCCCC}\toprule")
     a(r"\textbf{Splitting Method} & \textbf{Outcome Class} & \textbf{24h} & \textbf{48h} & \textbf{72h} & \textbf{96h} & \textbf{168h} \\\midrule")
     sps = ["Row-Wise (Random)","Patient-Level","Appointment-Time"]
     for si, sp in enumerate(sps):
         a(f"\\multirow{{3}}{{*}}{{{sp}}} ")
         for nm, ci in [("Cancellations",0),("No-Shows",1),("Shows",2)]:
-            vs = [_f(t4[c][sp][ci]) for c in CUTOFFS]
+            vs = [_pm(t4[c][sp][ci]["mean"], t4[c][sp][ci]["std"]) for c in CUTOFFS]
             a(f"& {nm:14s} & " + " & ".join(vs) + r" \\")
         if si < len(sps)-1: a(r"\midrule")
     a(r"\bottomrule\end{tabularx}\end{table*}")
@@ -651,93 +759,160 @@ def write_latex(t1, t2, t3, t4, t5, path):
 
     # TABLE 5
     a(r"\begin{table*}[t]\centering")
-    a(r"\caption{Counterfactual Analysis Sensitivity (CORRECTED): Absolute change in cancellation and no-show rates (pp).}")
-    a(r"\label{tab:counterfactual_sensitivity_final}\small")
+    a(r"\caption{Counterfactual Analysis: Absolute change in cancellation and no-show rates (pp). Mean $\pm$ SD aggregated via law of total variance over 10 holdout splits $\times$ 100 bootstrap iterations (for stochastic interventions).}")
+    a(r"\label{tab:counterfactual_robust}\small")
     a(r"\begin{tabularx}{\textwidth}{l l c c c c c}\toprule")
     a(r"\multirow{2}{*}{\textbf{Intervention}} & \multirow{2}{*}{\textbf{Metric}} & \textbf{24h} & \textbf{48h} & \textbf{72h} & \textbf{96h} & \textbf{168h} \\")
-    a(r"\cmidrule(lr){3-7}& & \multicolumn{5}{c}{\textit{(Mean $\pm$ SD across 10 model seeds)}} \\\midrule")
+    a(r"\cmidrule(lr){3-7}& & \multicolumn{5}{c}{\textit{(10 holdouts $\times$ 100 bootstrap, aggregated)}} \\\midrule")
     for ii, iv in enumerate(IVS):
         a(f"\\multirow{{2}}{{*}}{{{iv}}} ")
-        a("& $\\Delta$ Cancel (\\%) & " + " & ".join([_pm(t5[c][iv]["cancel"]) for c in CUTOFFS]) + r" \\")
-        a("& $\\Delta$ No-show (\\%) & " + " & ".join([_pm(t5[c][iv]["noshow"]) for c in CUTOFFS]) + r" \\")
+        a("& $\\Delta$ Cancel (\\%) & " + " & ".join([_pm(t5[c][iv]["cancel_mean"], t5[c][iv]["cancel_std"]) for c in CUTOFFS]) + r" \\")
+        a("& $\\Delta$ No-show (\\%) & " + " & ".join([_pm(t5[c][iv]["noshow_mean"], t5[c][iv]["noshow_std"]) for c in CUTOFFS]) + r" \\")
         if ii < len(IVS)-1: a(r"\midrule")
     a(r"\bottomrule\end{tabularx}")
-    a(r"\begin{flushleft}\footnotesize \textit{Note: $\Delta$ = absolute pp reduction. Positive = improvement.}\end{flushleft}\end{table*}")
+    a(r"\begin{flushleft}\footnotesize \textit{Note: $\Delta$ = absolute pp reduction. Positive = improvement. Stochastic interventions bootstrapped 100 times per holdout.}\end{flushleft}\end{table*}")
     a(""); a(r"\end{document}")
     with open(path, "w", encoding="utf-8") as f: f.write("\n".join(L))
 
 # =============================================================================
-# MAIN
+# PART 9 — MAIN
 # =============================================================================
 
 def main():
-    print("=" * 64)
-    print("  HCMS Hierarchical ML Pipeline  (single run, corrected)")
-    print("=" * 64)
+    print("=" * 70)
+    print("  HCMS Pipeline — Robust Holdout Experiment")
+    print("=" * 70)
 
     # ── load raw data ────────────────────────────────────────────────────
-    phase("Loading df_with_valid_indices_0717.csv")
+    step(f"[00:00] Loading df_with_valid_indices_0717.csv...")
     raw = pd.read_csv(os.path.join(DIR, "df_with_valid_indices_0717.csv"))
-    step(f"{len(raw):,} rows loaded")
+    step(f"  Loaded {len(raw):,} rows")
 
     # ── fast feature engineering ─────────────────────────────────────────
+    step(f"[00:00] Feature engineering (vectorized)...")
     df_all, ff = fast_feature_engineering(raw)
+    step(f"  {len(ff)} features ready")
 
-    # ── results containers ───────────────────────────────────────────────
-    t1, t2, t3, t4, t5 = {}, {}, {}, {}, {}
+    # ── results containers (per cutoff, aggregated over holdouts) ────────
+    t1_all, t3_all, t4_all, t5_all = {}, {}, {}, {}
 
     for ci, cutoff in enumerate(CUTOFFS):
-        phase(f"Cutoff {cutoff}h  ({ci+1}/{len(CUTOFFS)})")
+        print(f"\n{'─'*70}")
+        print(f"  Cutoff {cutoff}h ({ci+1}/{len(CUTOFFS)})")
+        print(f"{'─'*70}")
         df = build_labels(df_all.copy(), cutoff)
 
-        # Table 1
-        step("Table 1  pipeline (DT -> XGB)")
-        Xtr, Xte, ytr, yte, Xte_df = std_split(df, ff, "row")
-        s1, s2, m1, m2 = train_pipeline(Xtr, Xte, ytr, yte)
-        t1[cutoff] = (m1, m2)
+        # Collect results across 10 holdouts
+        t1_holdouts = []  # list of (m1, m2) tuples
+        t3_holdouts = []  # list of dicts {"noshow": acc, "noshow_f1": f1, "cancel": acc, "cancel_f1": f1}
+        t4_holdouts = {sp: [] for sp in ["Row-Wise (Random)", "Patient-Level", "Appointment-Time"]}
+        t5_holdouts = []  # list of dicts from run_cf_bootstrap
 
-        # Table 4
-        step("Table 4  split strategies")
-        t4[cutoff] = {}
-        t4[cutoff]["Row-Wise (Random)"] = combined_f1(s1, s2, Xte, yte)
-        Xtrp, Xtep, ytrp, ytep, _ = std_split(df, ff, "patient")
-        s1p, s2p, _, _ = train_pipeline(Xtrp, Xtep, ytrp, ytep)
-        t4[cutoff]["Patient-Level"] = combined_f1(s1p, s2p, Xtep, ytep)
-        Xtrt, Xtet, ytrt, ytet, _ = std_split(df, ff, "temporal")
-        s1t, s2t, _, _ = train_pipeline(Xtrt, Xtet, ytrt, ytet)
-        t4[cutoff]["Appointment-Time"] = combined_f1(s1t, s2t, Xtet, ytet)
+        for holdout in range(N_HOLDOUTS):
+            seed = RS + holdout
+            print(f"  Holdout {holdout+1:2d}/10 | seed={seed}", end="", flush=True)
 
-        # Tables 2 & 3
-        step("Table 2  semi-supervised")
-        Xb = df[ff].values
-        ns_f = (df["STATUS_CD"].isin(["No Show","Left without seen"])) | (df["cancelled_within"]==1)
-        Xns = Xb[ns_f]; yns = df.loc[ns_f, "noshow_reason_label"].values.astype(float)
-        t2[cutoff] = {}
-        for cn, tv in [("No Pseudo-Labels",None),("Pseudo-Labels (0.60)",0.60),("Pseudo-Labels (0.85)",0.85)]:
-            r = run_semi_sup(Xns, yns, ff, thr=tv)
-            for mn, v in r.items(): t2[cutoff][(mn, cn)] = v
+            # ── Table 1: Row-wise split with threshold tuning ────────────────
+            Xtr, Xval, Xte, ytr, yval, yte, Xte_df = holdout_split(df, ff, seed, kind="row")
+            
+            # Train models
+            s1, s2, _, _ = train_pipeline(Xtr, Xval, ytr, yval, seed=seed)
+            
+            # Tune thresholds on validation set
+            s1_thr, s2_thr = tune_thresholds(s1, s2, Xval, yval)
+            print(f" → train → tune (S1={s1_thr}, S2={s2_thr})", end="", flush=True)
+            
+            # Evaluate on test set with tuned thresholds
+            _, _, m1, m2 = train_pipeline(Xtr, Xte, ytr, yte, s1_thr=s1_thr, s2_thr=s2_thr, seed=seed)
+            t1_holdouts.append((m1, m2))
+            print(" → eval T1 ✓", end="", flush=True)
 
-        step("Table 3  reason prediction")
-        ca_f = (df["STATUS_CD"]=="Canceled") & (df["cancelled_within"]==0)
-        Xca = Xb[ca_f]; yca = df.loc[ca_f, "cancellation_reason_label"].values.astype(float)
-        ok = ~np.isnan(yca); Xca, yca = Xca[ok], yca[ok]
-        t3[cutoff] = {}
-        ns_r = run_semi_sup(Xns, yns, ff, thr=0.60)
-        ca_r = run_semi_sup(Xca, yca, ff, thr=None)
-        for mn in ["DecisionTree","XGBoost","MLP"]:
-            na, nf = ns_r.get(mn, (0,0)); ca_, cf_ = ca_r.get(mn, (0,0))
-            t3[cutoff][mn] = (na, nf, ca_, cf_)
+            # ── Table 3: XGBoost reason prediction (only XGBoost) ─────────────
+            Xb = df[ff].values
+            ns_f = (df["STATUS_CD"].isin(["No Show","Left without seen"])) | (df["cancelled_within"]==1)
+            Xns = Xb[ns_f]
+            yns = df.loc[ns_f, "noshow_reason_label"].values.astype(float)
+            
+            ca_f = (df["STATUS_CD"]=="Canceled") & (df["cancelled_within"]==0)
+            Xca = Xb[ca_f]
+            yca = df.loc[ca_f, "cancellation_reason_label"].values.astype(float)
+            ok = ~np.isnan(yca)
+            Xca, yca = Xca[ok], yca[ok]
+            
+            ns_xgb = run_semi_sup(Xns, yns, ff, thr=0.60, seed=seed).get("XGBoost", (0, 0))
+            ca_xgb = run_semi_sup(Xca, yca, ff, thr=None, seed=seed).get("XGBoost", (0, 0))
+            t3_holdouts.append({
+                "noshow": ns_xgb[0],
+                "noshow_f1": ns_xgb[1],
+                "cancel": ca_xgb[0],
+                "cancel_f1": ca_xgb[1],
+            })
+            print(" T3 ✓", end="", flush=True)
 
-        # Table 5
-        step("Table 5  counterfactual (10 seeds)")
-        t5[cutoff] = run_cf(Xtr, Xte_df, ytr, yte, ff)
+            # ── Table 4: Different split strategies ───────────────────────────
+            # Row-wise already done
+            t4_holdouts["Row-Wise (Random)"].append((m1["Cancel"]["f1"], m2["No-Show"]["f1"], m2["Show"]["f1"]))
+            
+            # Patient-level split
+            Xtr_p, Xval_p, Xte_p, ytr_p, yval_p, yte_p, _ = holdout_split(df, ff, seed, kind="patient")
+            s1_p, s2_p, _, _ = train_pipeline(Xtr_p, Xval_p, ytr_p, yval_p, seed=seed)
+            s1_thr_p, s2_thr_p = tune_thresholds(s1_p, s2_p, Xval_p, yval_p)
+            _, _, m1_p, m2_p = train_pipeline(Xtr_p, Xte_p, ytr_p, yte_p, s1_thr=s1_thr_p, s2_thr=s2_thr_p, seed=seed)
+            t4_holdouts["Patient-Level"].append((m1_p["Cancel"]["f1"], m2_p["No-Show"]["f1"], m2_p["Show"]["f1"]))
+            
+            # Temporal split
+            Xtr_t, Xval_t, Xte_t, ytr_t, yval_t, yte_t, _ = holdout_split(df, ff, seed, kind="temporal")
+            s1_t, s2_t, _, _ = train_pipeline(Xtr_t, Xval_t, ytr_t, yval_t, seed=seed)
+            s1_thr_t, s2_thr_t = tune_thresholds(s1_t, s2_t, Xval_t, yval_t)
+            _, _, m1_t, m2_t = train_pipeline(Xtr_t, Xte_t, ytr_t, yte_t, s1_thr=s1_thr_t, s2_thr=s2_thr_t, seed=seed)
+            t4_holdouts["Appointment-Time"].append((m1_t["Cancel"]["f1"], m2_t["No-Show"]["f1"], m2_t["Show"]["f1"]))
+            print(" T4 ✓", end="", flush=True)
+
+            # ── Table 5: Counterfactual with bootstrap ───────────────────────
+            t5_res = run_cf_bootstrap(Xtr, Xte_df, ytr, yte, ff, s1_thr, s2_thr, seed=seed)
+            t5_holdouts.append(t5_res)
+            print(" T5 ✓")
+
+        # ── Aggregate across holdouts ─────────────────────────────────────────
+        print(f"  Aggregating results...", end="", flush=True)
+        
+        # Table 1: aggregate m1, m2
+        m1_list = [h[0] for h in t1_holdouts]
+        m2_list = [h[1] for h in t1_holdouts]
+        t1_all[cutoff] = (aggregate_metrics(m1_list), aggregate_metrics(m2_list))
+        
+        # Table 3: aggregate XGBoost results
+        t3_all[cutoff] = {
+            "noshow": {"mean": np.mean([h["noshow"] for h in t3_holdouts]),
+                       "std": np.std([h["noshow"] for h in t3_holdouts], ddof=1)},
+            "noshow_f1": {"mean": np.mean([h["noshow_f1"] for h in t3_holdouts]),
+                          "std": np.std([h["noshow_f1"] for h in t3_holdouts], ddof=1)},
+            "cancel": {"mean": np.mean([h["cancel"] for h in t3_holdouts]),
+                       "std": np.std([h["cancel"] for h in t3_holdouts], ddof=1)},
+            "cancel_f1": {"mean": np.mean([h["cancel_f1"] for h in t3_holdouts]),
+                          "std": np.std([h["cancel_f1"] for h in t3_holdouts], ddof=1)},
+        }
+        
+        # Table 4: aggregate per split strategy
+        t4_all[cutoff] = {}
+        for sp in ["Row-Wise (Random)", "Patient-Level", "Appointment-Time"]:
+            vals = t4_holdouts[sp]  # list of (cancel_f1, noshow_f1, show_f1) tuples
+            t4_all[cutoff][sp] = [
+                {"mean": np.mean([v[i] for v in vals]), "std": np.std([v[i] for v in vals], ddof=1)}
+                for i in range(3)
+            ]
+        
+        # Table 5: law of total variance aggregation
+        t5_all[cutoff] = aggregate_table5(t5_holdouts)
+        print(" done")
 
     # ── export ───────────────────────────────────────────────────────────
-    phase("Exporting LaTeX")
-    out = os.path.join(DIR, "revised_tables_corrected.tex")
-    write_latex(t1, t2, t3, t4, t5, out)
-    step(f"Saved: {out}")
-    print(f"\n{'='*64}\n  DONE\n{'='*64}\n")
+    print(f"\n{'─'*70}")
+    print(f"  Exporting LaTeX...")
+    out = os.path.join(DIR, "revised_tables_robust.tex")
+    write_latex(t1_all, t3_all, t4_all, t5_all, out)
+    print(f"  Saved: {out}")
+    print(f"\n{'='*70}\n  DONE\n{'='*70}\n")
 
 if __name__ == "__main__":
     main()
